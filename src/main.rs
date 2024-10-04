@@ -78,7 +78,17 @@ fn handle_connection(mut stream: TcpStream, id: ConnId) -> anyhow::Result<()> {
             if let Some(string) = url.strip_prefix("/echo/") {
                 Response::text(string.to_owned())
             } else if let Some(file_name) = url.strip_prefix("/files/") {
-                Response::file(file_name)
+                match request.line.method {
+                    Method::Get => Response::file(file_name),
+                    Method::Post => {
+                        let contents = request
+                            .body
+                            .context("POST request to /files must have a body")?;
+                        fs::write(format!("files/{file_name}"), contents)
+                            .context("failed to write file to disk")?;
+                        Response::created()
+                    }
+                }
             } else {
                 Response::not_found()
             }
@@ -139,6 +149,7 @@ impl FromStr for Request {
 
 #[derive(Debug, Clone)]
 struct RequestLine {
+    method: Method,
     url: String,
 }
 
@@ -146,13 +157,20 @@ impl FromStr for RequestLine {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let url = s
-            .split_whitespace()
-            .nth(1)
+        let mut parts = s.split_whitespace();
+
+        let method: Method = parts
+            .next()
+            .context("could not find HTTP method in request line")?
+            .parse()
+            .context("failed to parse HTTP method")?;
+
+        let url = parts
+            .next()
             .context("could find URL in request line")?
             .to_owned();
 
-        Ok(Self { url })
+        Ok(Self { method, url })
     }
 }
 
@@ -192,6 +210,14 @@ impl Response {
         }
     }
 
+    fn created() -> Self {
+        Self {
+            status_code: 201,
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
     fn file(file_name: &str) -> Self {
         let Ok(text) = fs::read_to_string(format!("files/{file_name}")) else {
             return Self::not_found();
@@ -215,6 +241,7 @@ impl fmt::Display for Response {
             "HTTP/1.1 {status}\r\n{headers}\r\n{body}",
             status = match self.status_code {
                 200 => "200 OK",
+                201 => "201 Created",
                 404 => "404 Not Found",
                 code => todo!("unhandled status code: {code}"),
             },
@@ -225,6 +252,24 @@ impl fmt::Display for Response {
                 .fold(String::new(), |acc, s| acc + &s),
             body = self.body.as_deref().unwrap_or_default(),
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Get,
+    Post,
+}
+
+impl FromStr for Method {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_ref() {
+            "get" => Ok(Self::Get),
+            "post" => Ok(Self::Post),
+            _ => Err(anyhow!("{s} is not a valid HTTP method")),
+        }
     }
 }
 
