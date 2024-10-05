@@ -2,14 +2,18 @@
 #![warn(missing_debug_implementations)]
 
 use std::{
-    fmt, fs,
-    io::prelude::*,
+    fmt,
+    fs::{self, File},
+    io::{self, prelude::*},
     net::{TcpListener, TcpStream},
     str::FromStr,
 };
 
 use anyhow::{anyhow, Context};
+
 use threadpool::ThreadPool;
+
+use flate2::{write::GzEncoder, Compression};
 
 const NUM_THREADS: usize = 500;
 
@@ -57,7 +61,7 @@ fn handle_connection(mut stream: TcpStream, id: ConnId) -> anyhow::Result<()> {
 
     log::debug!("id = {id}, request = {request:#?}");
 
-    let response = match request.line.url.as_ref() {
+    let mut response = match request.line.url.as_ref() {
         "/" => Response::empty(),
         "/user-agent" => {
             let user_agent = request
@@ -95,9 +99,15 @@ fn handle_connection(mut stream: TcpStream, id: ConnId) -> anyhow::Result<()> {
         }
     };
 
+    if request.headers.contains(&Header::AcceptEncoding) {
+        response = response.compressed();
+    }
+
     log::debug!("id = {id}, response = {response:#?}");
 
-    write!(&mut stream, "{}", response).context("failed to write to client")?;
+    response
+        .write_to(&mut stream)
+        .context("failed to write to client")?;
 
     stream.flush().context("failed to write to client")?;
 
@@ -179,7 +189,7 @@ struct Response {
     // TODO: change to enum
     status_code: u32,
     headers: Vec<Header>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
 }
 
 impl Response {
@@ -206,7 +216,7 @@ impl Response {
                 Header::ContentType(ContentType::TextPlain),
                 Header::ContentLength(text.len()),
             ],
-            body: Some(text),
+            body: Some(text.into_bytes()),
         }
     }
 
@@ -219,26 +229,52 @@ impl Response {
     }
 
     fn file(file_name: &str) -> Self {
-        let Ok(text) = fs::read_to_string(format!("files/{file_name}")) else {
+        let Ok(mut file) = File::open(format!("files/{file_name}")) else {
             return Self::not_found();
         };
+
+        // TODO: change to server error
+        let mut content = Vec::new();
+        if file.read_to_end(&mut content).is_err() {
+            log::error!("failed to read file {file_name:?}");
+            return Self::not_found();
+        }
 
         Response {
             status_code: 200,
             headers: vec![
                 Header::ContentType(ContentType::ApplicationOctetStream),
-                Header::ContentLength(text.len()),
+                Header::ContentLength(content.len()),
             ],
-            body: Some(text),
+            body: Some(content),
         }
     }
-}
 
-impl fmt::Display for Response {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn compressed(mut self) -> Self {
+        debug_assert!(!self.headers.contains(&Header::ContentEncoding));
+
+        self.headers.push(Header::ContentEncoding);
+
+        if let Some(body) = self.body.as_mut() {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(body).unwrap();
+            *body = encoder.finish().unwrap();
+            let content_len_header = self
+                .headers
+                .iter_mut()
+                .find(|header| matches!(header, Header::ContentLength(_)))
+                .expect("expected to have 'Content-Length' header in response with body");
+
+            *content_len_header = Header::ContentLength(body.len());
+        }
+
+        self
+    }
+
+    fn write_to(&self, mut w: impl io::Write) -> io::Result<()> {
         write!(
-            f,
-            "HTTP/1.1 {status}\r\n{headers}\r\n{body}",
+            w,
+            "HTTP/1.1 {status}\r\n{headers}\r\n",
             status = match self.status_code {
                 200 => "200 OK",
                 201 => "201 Created",
@@ -250,8 +286,13 @@ impl fmt::Display for Response {
                 .iter()
                 .map(|header| format!("{header}\r\n"))
                 .fold(String::new(), |acc, s| acc + &s),
-            body = self.body.as_deref().unwrap_or_default(),
-        )
+        )?;
+
+        if let Some(body) = self.body.as_ref() {
+            w.write_all(body)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -278,6 +319,9 @@ enum Header {
     ContentType(ContentType),
     ContentLength(usize),
     UserAgent(String),
+    // assume gzip
+    AcceptEncoding,
+    ContentEncoding,
 }
 
 impl fmt::Display for Header {
@@ -285,6 +329,7 @@ impl fmt::Display for Header {
         match self {
             Self::ContentType(content_type) => write!(f, "Content-Type: {content_type}"),
             Self::ContentLength(length) => write!(f, "Content-Length: {length}"),
+            Self::ContentEncoding => write!(f, "Content-Encoding: gzip"),
             _ => todo!(),
         }
     }
@@ -295,15 +340,19 @@ impl FromStr for Header {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut parts = s.split(':').map(str::trim);
+
         let name = parts
             .next()
             .context("failed to find header name, maybe it's missing a ':'?")?;
+
         let value = parts
             .next()
             .context("failed to find header value, maybe it's missing a ':'?")?;
 
         match name.to_lowercase().as_ref() {
             "user-agent" => Ok(Self::UserAgent(value.to_owned())),
+            "accept-encoding" if value == "gzip" => Ok(Self::AcceptEncoding),
+            "accept-encoding" => Err(anyhow!("failed to parse 'Accept-Encoding': unknown encoding {value:?}, only 'gzip' is supported")),
             name => Err(anyhow!("unknown header: {name:?}")),
         }
     }
